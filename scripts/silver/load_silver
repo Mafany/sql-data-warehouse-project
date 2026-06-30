@@ -1,0 +1,145 @@
+# %% [markdown]
+# # Silver Layer Full Refresh ETL Pipeline
+# This notebook orchestrates the extraction of Bronze data files, transforms them by adding operational metadata columns (`dwh_created_date`), and implements a clean Full Refresh (Truncate and Load) strategy into the target MySQL Silver database.
+
+# %%
+# Install required libraries if missing
+!pip install pandas sqlalchemy pymysql
+
+# %%
+import os
+import logging
+from datetime import datetime
+import urllib.parse
+import pandas as pd
+from sqlalchemy import create_engine, text
+
+# 1. DATABASE CONFIGURATION
+DB_USER = "root"
+DB_PASSWORD = "Your Password"
+DB_HOST = "localhost"
+DB_PORT = 3306
+DB_NAME = "silver"  # Main target database for the silver layer
+
+# Safely encode special characters (handles the '@' sign in your password)
+safe_password = urllib.parse.quote_plus(DB_PASSWORD)
+DATABASE_URI = f"mysql+pymysql://{DB_USER}:{safe_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+engine = create_engine(DATABASE_URI)
+
+# 2. FILE DIRECTORY CONFIGURATION
+BASE_DIR = r"C:/Users/Mola/Desktop/Folders/Data Warehouse/Project/Dataset"
+
+DATASETS = [
+    {"file_path": os.path.join(BASE_DIR, "CRM/cust_info.csv"), "table": "crm_cust_info"},
+    {"file_path": os.path.join(BASE_DIR, "CRM/prd_info.csv"), "table": "crm_prd_info"},
+    # Corrected target table mapping here to crm_sales_details
+    {"file_path": r"C:\Users\Mola\Desktop\Folders\Data Warehouse\Project\Dataset\CRM\Bronze\sales_details.csv", "table": "crm_sales_details"},
+    {"file_path": os.path.join(BASE_DIR, "ERP/CUST_AZ12.csv"), "table": "erp_cust_az12"},
+    {"file_path": os.path.join(BASE_DIR, "ERP/LOC_A101.csv"), "table": "erp_loc_a101"},
+    {"file_path": os.path.join(BASE_DIR, "ERP/PX_CAT_G1V2.csv"), "table": "erp_px_cat_g1v2"},
+]
+
+# 3. LOGGING SETUP
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("SilverETL")
+
+current_batch_time = datetime.now()
+results = []
+
+# %%
+# RUN THE ETL LOOP
+for ds in DATASETS:
+    start_time = datetime.now()
+    src = ds["file_path"]
+    table = ds["table"]
+    
+    logger.info(f"Processing Silver Layer for table: {table}")
+    
+    if not os.path.exists(src):
+        error_msg = f"Source file not found: {src}"
+        logger.error(error_msg)
+        results.append({
+            "Table": table,
+            "Source Rows": 0,
+            "Target Rows": 0,
+            "Status": "FAILED",
+            "Duration": str(datetime.now() - start_time),
+            "Error": error_msg
+        })
+        continue
+        
+    try:
+        # Step A: Extract Data
+        df = pd.read_csv(src)
+        df.columns = df.columns.str.strip().str.lower()
+        df = df.drop_duplicates()
+        
+        # Step B: Transform - Inject the mandatory operational tracking column
+        df['dwh_created_date'] = current_batch_time
+        
+        # Step C: Database Verification
+        with engine.begin() as conn:
+            # Check if table exists in MySQL Workbench under the chosen name
+            exists = conn.execute(text("""
+                SELECT COUNT(*) 
+                FROM information_schema.tables 
+                WHERE table_schema = :db AND table_name = :tbl
+            """), {"db": DB_NAME, "tbl": table}).scalar()
+            
+            if not exists:
+                raise Exception(f"Target table '{DB_NAME}.{table}' does not exist in MySQL Workbench. Please confirm your corrected DDL script was executed.")
+            
+            # Fetch table columns to safely match inputs without breaking validation constraints
+            db_cols_query = conn.execute(text("""
+                SELECT COLUMN_NAME 
+                FROM information_schema.columns 
+                WHERE table_schema = :db AND table_name = :tbl
+            """), {"db": DB_NAME, "tbl": table})
+            db_cols = [row[0].lower() for row in db_cols_query.fetchall()]
+                
+            # Perform clean refresh truncation
+            conn.execute(text(f"TRUNCATE TABLE `{table}`"))
+            
+        # Step D: Match column list precisely to database configuration
+        available_cols = [c for c in df.columns if c in db_cols]
+        df_aligned = df[available_cols].copy()
+            
+        # Step E: Load Data into destination table
+        df_aligned.to_sql(
+            name=table,
+            con=engine,
+            if_exists="append",
+            index=False,
+            chunksize=5000,
+            method="multi"
+        )
+        
+        # Step F: Row count audit confirmation check
+        tgt_count = pd.read_sql(f"SELECT COUNT(*) cnt FROM `{table}`", engine).iloc[0, 0]
+        
+        results.append({
+            "Table": table,
+            "Source Rows": len(df_aligned),
+            "Target Rows": tgt_count,
+            "Status": "SUCCESS",
+            "Duration": str(datetime.now() - start_time),
+            "Error": ""
+        })
+        
+    except Exception as ex:
+        error_details = str(ex)
+        logger.exception(f"Error encountered on table {table}: {error_details}")
+        results.append({
+            "Table": table,
+            "Source Rows": 0,
+            "Target Rows": 0,
+            "Status": "FAILED",
+            "Duration": str(datetime.now() - start_time),
+            "Error": error_details
+        })
+
+# %%
+# Render Summary Audit Matrix Report
+summary_df = pd.DataFrame(results)
+summary_df
+
